@@ -26,7 +26,7 @@ from collections import namedtuple
 
 logger = logging.getLogger(__name__)
 
-PROVIDER = os.getenv("LLM_PROVIDER", "gemini").strip().lower() or "gemini"
+PROVIDER = os.getenv("LLM_PROVIDER", "ollama").strip().lower() or "ollama"
 if PROVIDER not in ("gemini", "ollama"):
     raise RuntimeError("LLM_PROVIDER must be 'gemini' or 'ollama', not %r" % PROVIDER)
 
@@ -41,6 +41,11 @@ OLLAMA_TIMEOUT_S = float(os.getenv("OLLAMA_TIMEOUT_S", "120"))
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
 
 DEFAULT_CHAT_MODEL = "gemma4:e4b-it-qat" if PROVIDER == "ollama" else "gemini-2.5-flash-lite"
+# nomic-embed-text is 768-dim, matching the Pinecone index's existing EMBED_DIM,
+# so switching providers does not require recreating the index. Vectors from a
+# different model are not comparable to the old ones though: existing course
+# material still needs re-embedding into it (see docs/OLLAMA.md).
+EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text" if PROVIDER == "ollama" else "gemini-embedding-001")
 
 Result = namedtuple("Result", "text tool_call usage")
 Chunk = namedtuple("Chunk", "text tool_call usage")
@@ -152,6 +157,11 @@ def _gemini_stream(model, contents, system, tools, temperature):
         yield Chunk(text, _gemini_tool_call(chunk), _gemini_usage(usage) if usage else None)
 
 
+def _gemini_embed_batch(texts):
+    result = _gemini_client().models.embed_content(model="models/" + EMBED_MODEL, contents=texts)
+    return [e.values for e in result.embeddings]
+
+
 # ---------- Ollama ----------
 
 def _ollama_messages(contents, system):
@@ -252,6 +262,20 @@ def _ollama_stream(model, contents, system, tools, temperature):
                         _ollama_usage(data) if data.get("done") else None)
 
 
+def _ollama_embed_batch(texts):
+    with _ollama_open({"model": EMBED_MODEL, "input": list(texts)}, "/api/embed") as resp:
+        try:
+            data = json.loads(resp.read().decode("utf-8"))
+        except ValueError as e:
+            raise LLMError("Ollama returned a non-JSON response") from e
+    if data.get("error"):
+        raise LLMError("Ollama: %s" % data["error"])
+    embeddings = data.get("embeddings")
+    if not embeddings:
+        raise LLMError("Ollama returned no embeddings")
+    return embeddings
+
+
 # ---------- public ----------
 
 def health(model):
@@ -276,3 +300,17 @@ def stream(model, contents, system=None, tools=None, temperature=None):
     if PROVIDER == "ollama":
         return _ollama_stream(model, contents, system, tools, temperature)
     return _gemini_stream(model, contents, system, tools, temperature)
+
+
+def embed_batch(texts):
+    """Embed many texts in one request and return their vectors, in input order."""
+    if not texts:
+        return []
+    if PROVIDER == "ollama":
+        return _ollama_embed_batch(texts)
+    return _gemini_embed_batch(texts)
+
+
+def embed(text):
+    """Return one embedding vector for `text`, the same way app.py's old embed() did."""
+    return embed_batch([text])[0]
